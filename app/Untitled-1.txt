@@ -1,0 +1,357 @@
+# =============================================================
+#  SueldoLint – MVP v0.1
+#  Autor: Daniela (17, Chile) · Mayo 2025
+#  Repositorio imaginario: https://github.com/tu‑usuario/sueldo‑lint
+# =============================================================
+#  👉  Estructura recomendada del proyecto
+#
+#  sueldo_lint/
+#  ├── __init__.py
+#  ├── core.py          # motor de validación
+#  ├── reporter.py      # genera HTML estilado
+#  └── cli.py           # interfaz de línea de comandos
+#  templates/
+#  └── report.html.j2   # plantilla base (Jinja2)
+#  pyproject.toml       # metadatos + dependencias
+#  README.md            # guía de uso
+#  requirements.txt     # alternativa a pyproject
+# =============================================================
+
+# --- file: sueldo_lint/__init__.py -----------------------------------------
+"""Paquete SueldoLint – Validador de planillas de remuneraciones chilenas.
+
+Uso rápido (CLI):
+    $ sueldo-lint check planilla_mayo.csv --out reporte.html
+"""
+from .core import validate_dataframe, DEFAULT_RULES
+from .reporter import render_html
+
+__all__ = [
+    "validate_dataframe",
+    "render_html",
+    "DEFAULT_RULES",
+]
+
+__version__ = "0.1.0"
+
+# --- file: sueldo_lint/core.py ---------------------------------------------
+"""Motor de validación.
+Reglas mínimas:
+  1. Tope imponible mensual (87,8 UF 👉 CONST_TOPE_IMPONIBLE_UF).
+  2. Recargo 30 % por domingos trabajados (art. 38 inc. 2 CT).
+"""
+from __future__ import annotations
+
+import math
+import os
+from dataclasses import dataclass, field
+from datetime import date
+from typing import Dict, List
+
+import pandas as pd
+
+# --------------------------------------------------------------------------
+# ⚙️  Parámetros legales (pueden variarse desde variables de entorno)
+# --------------------------------------------------------------------------
+CONST_TOPE_IMPONIBLE_UF = float(os.getenv("SUELDO_LINT_TOPE_UF", "87.8"))
+UF_HOY_CLP = float(os.getenv("SUELDO_LINT_UF_CLP", "37800"))  # valor UF aproximado
+
+TOPE_IMPONIBLE_CLP = CONST_TOPE_IMPONIBLE_UF * UF_HOY_CLP
+
+RECARGO_DOMINGO_PCT = 0.30  # 30 %
+
+# --------------------------------------------------------------------------
+# 📝 Reglas configurables
+# --------------------------------------------------------------------------
+@dataclass
+class RuleResult:
+    nombre: str
+    mensaje: str
+    fila: int
+    severidad: str = "error"  # error | warning | info
+
+@dataclass
+class ValidationRule:
+    nombre: str
+    descripcion: str
+    fn: callable  # (pd.Series, Dict) -> List[RuleResult]
+
+# --------------------------------------------------------------------------
+# Regla 1 – Tope imponible
+# --------------------------------------------------------------------------
+
+def _check_tope_imponible(row: pd.Series, params: Dict) -> List[RuleResult]:
+    errores: List[RuleResult] = []
+    if pd.notna(row["Imponible_CLP"]) and row["Imponible_CLP"] > TOPE_IMPONIBLE_CLP:
+        errores.append(
+            RuleResult(
+                nombre="tope_imponible",
+                mensaje=(
+                    f"Imponible supera tope legal: {row['Imponible_CLP']:,} > "
+                    f"{TOPE_IMPONIBLE_CLP:,.0f} CLP (87,8 UF)"
+                ),
+                fila=int(row.name) + 2,  # +2 para considerar header 0‑base
+            )
+        )
+    return errores
+
+# --------------------------------------------------------------------------
+# Regla 2 – Recargo Domingo 30 %
+# --------------------------------------------------------------------------
+
+def _check_recargo_domingos(row: pd.Series, params: Dict) -> List[RuleResult]:
+    errores: List[RuleResult] = []
+    domingos = row.get("Domingos_Trabajados", 0) or 0
+    if domingos <= 0:
+        return errores
+    sueldo_base = row.get("Sueldo_Base_CLP", math.nan)
+    if pd.isna(sueldo_base):
+        return errores
+    # sueldo diario = sueldo_base / 30
+    recargo_min = (sueldo_base / 30) * RE CARGO_DOMINGO_PCT * domingos
+    recargo_pagado = row.get("Pago_Recargo_Domingos_CLP", 0)
+    if recargo_pagado + 1 < recargo_min:  # tolerancia 1 peso
+        errores.append(
+            RuleResult(
+                nombre="recargo_domingo",
+                mensaje=(
+                    f"Recargo domingos insuficiente: pagado {recargo_pagado:,} CLP, "
+                    f"mínimo legal {recargo_min:,.0f} CLP"
+                ),
+                fila=int(row.name) + 2,
+            )
+        )
+    return errores
+
+# --------------------------------------------------------------------------
+# Tabla de reglas por defecto
+# --------------------------------------------------------------------------
+DEFAULT_RULES: List[ValidationRule] = [
+    ValidationRule(
+        nombre="tope_imponible",
+        descripcion="Imponible no debe superar 87,8 UF (2025).",
+        fn=_check_tope_imponible,
+    ),
+    ValidationRule(
+        nombre="recargo_domingo",
+        descripcion="Recargo del 30 % por domingos trabajados (CT art. 38).",
+        fn=_check_recargo_domingos,
+    ),
+]
+
+# --------------------------------------------------------------------------
+# Función principal de validación
+# --------------------------------------------------------------------------
+
+def validate_dataframe(df: pd.DataFrame, rules: List[ValidationRule] | None = None) -> pd.DataFrame:
+    """Devuelve un DataFrame `errores` con columnas:
+    [fila, nombre_regla, mensaje, severidad]
+    """
+    if rules is None:
+        rules = DEFAULT_RULES
+
+    resultados: List[RuleResult] = []
+    for _, row in df.iterrows():
+        for rule in rules:
+            resultados.extend(rule.fn(row, {}))
+
+    if not resultados:
+        return pd.DataFrame(columns=["fila", "regla", "mensaje", "severidad"])
+
+    return pd.DataFrame(
+        [
+            {
+                "fila": r.fila,
+                "regla": r.nombre,
+                "mensaje": r.mensaje,
+                "severidad": r.severidad,
+            }
+            for r in resultados
+        ]
+    )
+
+# --- file: sueldo_lint/reporter.py -----------------------------------------
+"""Genera un reporte HTML simple usando pandas + Jinja2 (opcional)."""
+
+from __future__ import annotations
+
+import pathlib
+from datetime import datetime
+from typing import Optional
+
+import pandas as pd
+
+_HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="utf-8" />
+    <title>SueldoLint – Reporte</title>
+    <style>
+        body { font-family: sans-serif; margin: 2rem; }
+        h1 { color: #b30000; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ddd; padding: 6px; }
+        th { background: #f2f2f2; }
+        tr.error { background: #ffe6e6; }
+        tr.warning { background: #fff5e6; }
+        .ok { color: #007a00; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>SueldoLint – Reporte de Validación</h1>
+    <p>Generado: {{ timestamp }}</p>
+    {% if errors.empty %}
+        <p class="ok">✔ No se encontraron errores.</p>
+    {% else %}
+        <table>
+            <thead>
+                <tr><th>Fila</th><th>Regla</th><th>Mensaje</th></tr>
+            </thead>
+            <tbody>
+            {% for _, r in errors.iterrows() %}
+                <tr class="{{ r.severidad }}">
+                    <td>{{ r.fila }}</td>
+                    <td>{{ r.regla }}</td>
+                    <td>{{ r.mensaje }}</td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    {% endif %}
+</body>
+</html>
+"""
+
+try:
+    from jinja2 import Template
+except ImportError:
+    Template = None  # type: ignore
+
+
+def render_html(errors: pd.DataFrame, out_path: str | pathlib.Path) -> None:
+    """Renderiza el HTML y lo guarda en *out_path*."""
+    timestamp = datetime.now().strftime("%d‑%m‑%Y %H:%M:%S")
+    if Template:
+        html = Template(_HTML_TEMPLATE).render(errors=errors, timestamp=timestamp)
+    else:
+        # fallback rudimentario sin Jinja2
+        html = errors.to_html(index=False) if not errors.empty else "<p>No se encontraron errores.</p>"
+        html = f"<html><body><h1>SueldoLint</h1><p>{timestamp}</p>{html}</body></html>"
+
+    pathlib.Path(out_path).write_text(html, encoding="utf-8")
+
+# --- file: sueldo_lint/cli.py ---------------------------------------------
+"""CLI rápido con argparse.
+
+Instalación dev:
+    $ pip install -e .[dev]
+
+Uso:
+    $ sueldo-lint check planilla.csv --out reporte.html
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+from .core import validate_dataframe
+from .reporter import render_html
+
+
+def _cmd_check(args: argparse.Namespace) -> None:
+    df = pd.read_csv(args.input)
+    errors = validate_dataframe(df)
+    if args.out:
+        render_html(errors, args.out)
+        print(f"✅ Reporte generado: {args.out}")
+    else:
+        if errors.empty:
+            print("✔ No se encontraron errores")
+        else:
+            print(errors.to_markdown(index=False))
+            sys.exit(1)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(prog="sueldo-lint", description="Validador de planillas de sueldo chilenas")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_check = sub.add_parser("check", help="Valida un archivo CSV de nómina")
+    p_check.add_argument("input", type=Path, help="Ruta al CSV de entrada")
+    p_check.add_argument("--out", type=Path, help="Ruta al HTML de salida")
+    p_check.set_defaults(func=_cmd_check)
+
+    args = parser.parse_args(argv)
+    args.func(args)
+
+if __name__ == "__main__":
+    main()
+
+# --- file: pyproject.toml --------------------------------------------------
+"""
+[project]
+name = "sueldo-lint"
+version = "0.1.0"
+description = "Validador de planillas de sueldo chilenas (tope imponible, recargo dominical, etc.)"
+authors = [ { name = "Daniela", email = "daniela@example.com" } ]
+requires-python = ">=3.9"
+keywords = ["sueldo", "payroll", "chile", "validator"]
+license = { text = "MIT" }
+readme = "README.md"
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Topic :: Office/Business",
+]
+
+[project.optional-dependencies]
+dev = ["black", "ruff", "pytest"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+"""
+
+# --- file: README.md -------------------------------------------------------
+"""
+# SueldoLint
+
+Validador automático de planillas de remuneraciones chilenas.
+
+```bash
+# instalación temporal (entorno virtual recomendado)
+pip install -e .
+
+# validar un CSV
+autopep8
+sueldo-lint check nomina_mayo.csv --out reporte.html
+```
+
+## Entrada esperada
+CSV con al menos estas columnas (case‑sensitive):
+
+| Columna | Tipo | Descripción |
+|---------|------|-------------|
+| Imponible_CLP | num | Total imponible del trabajador (pesos) |
+| Sueldo_Base_CLP | num | Sueldo base mensual (pesos) |
+| Domingos_Trabajados | int | Número de domingos trabajados en el mes |
+| Pago_Recargo_Domingos_CLP | num | Monto pagado por recargo del 30 % |
+
+Puedes renombrar o agregar columnas adicionales; simplemente no serán usadas.
+
+## Roadmap
+- [ ] Regla descuento seguro de cesantía (2,4 % empleador, 0,6 % trabajador)
+- [ ] API REST Flask/FastAPI
+- [ ] Plugin Google Sheets & Excel
+- [ ] Internacionalización (Perú, Colombia…)
+"""
